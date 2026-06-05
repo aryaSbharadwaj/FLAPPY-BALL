@@ -1,0 +1,254 @@
+#define SDL_MAIN_HANDLED
+#include <SDL2/SDL.h>
+#include <stdio.h>
+#include <stdlib.h> 
+#include <time.h>   
+#include <math.h>
+
+#define MAX_TRAIL 5
+
+// Global Audio Configuration to prevent hardware wakeup lag
+SDL_AudioDeviceID audioDevice;
+int16_t* jumpSoundBuffer = NULL;
+int jumpSampleCount = 0;
+int16_t* crashSoundBuffer = NULL;
+int crashSampleCount = 0;
+
+// Pre-generate audio buffers when the game boots up
+void initAudioSystem() {
+    SDL_AudioSpec want, have;
+    SDL_zero(want);
+    want.freq = 44100;
+    want.format = AUDIO_S16SYS;
+    want.channels = 1;
+    want.samples = 512; // Tiny buffer size for zero latency
+
+    audioDevice = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+    if (audioDevice != 0) {
+        // Pre-build Jump Sound (600Hz, 30ms)
+        jumpSampleCount = have.freq * 30 / 1000;
+        jumpSoundBuffer = malloc(jumpSampleCount * sizeof(int16_t));
+        for (int i = 0; i < jumpSampleCount; i++) {
+            jumpSoundBuffer[i] = (sin(2.0 * M_PI * 600 * i / have.freq) > 0) ? 1500 : -1500;
+        }
+
+        // Pre-build Crash Sound (150Hz, 150ms)
+        crashSampleCount = have.freq * 150 / 1000;
+        crashSoundBuffer = malloc(crashSampleCount * sizeof(int16_t));
+        for (int i = 0; i < crashSampleCount; i++) {
+            crashSoundBuffer[i] = (sin(2.0 * M_PI * 150 * i / have.freq) > 0) ? 2000 : -2000;
+        }
+        
+        SDL_PauseAudioDevice(audioDevice, 0); // Start playing silence/ready mode
+    }
+}
+
+void playPreloadedSound(int16_t* buffer, int sampleCount) {
+    if (audioDevice != 0 && buffer != NULL) {
+        SDL_ClearQueuedAudio(audioDevice); // Wipe old lingering notes immediately
+        SDL_QueueAudio(audioDevice, buffer, sampleCount * sizeof(int16_t));
+    }
+}
+
+void drawCircle(SDL_Renderer* renderer, int centerX, int centerY, int radius) {
+    for (int w = 0; w < radius * 2; w++) {
+        for (int h = 0; h < radius * 2; h++) {
+            int dx = radius - w;
+            int dy = radius - h;
+            if ((dx*dx + dy*dy) <= (radius * radius)) {
+                SDL_RenderDrawPoint(renderer, centerX + dx, centerY + dy);
+            }
+        }
+    }
+}
+
+int main(int argc, char* args[]) {
+    SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO);
+    srand(time(NULL)); 
+
+    // Initialize the zero-latency audio engine
+    initAudioSystem();
+
+    SDL_Color bgColor = { 15, 10, 30, 255 };       
+    SDL_Color birdColor = { 255, 215, 0, 255 };    
+    SDL_Color eyeColor = { 255, 255, 255, 255 };   
+    SDL_Color pipeColor = { 0, 200, 150, 255 };    
+    SDL_Color cityColor = { 35, 25, 55, 255 };     
+
+    SDL_Window* window = SDL_CreateWindow("NIE Flappy Bird Pro", 
+        SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 640, 480, SDL_WINDOW_SHOWN);
+        
+    // Hardware VSync added here to fix the choppy graphics!
+    SDL_Renderer* renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+
+    float birdX = 150.0; 
+    float birdY = 240.0;
+    float velocity = 0.0;
+    float gravity = 0.22; 
+    float jumpStrength = -5.2; 
+    int birdRadius = 15;
+
+    int trailX[MAX_TRAIL];
+    int trailY[MAX_TRAIL];
+    for(int i = 0; i < MAX_TRAIL; i++) { trailX[i] = -100; trailY[i] = -100; }
+    
+    // Stable architectural heights for background buildings to eliminate structural glitches
+    float bgX = 0.0;
+    float bgSpeed = 0.5; 
+    int buildingHeights[8] = { 220, 280, 200, 260, 240, 210, 270, 230 };
+
+    float pipeX = 640.0;      
+    float initialPipeSpeed = 2.5; 
+    float currentPipeSpeed = initialPipeSpeed;
+    int pipeWidth = 65;
+    int gapY = 150;           
+    int initialGapHeight = 150;
+    int currentGapHeight = initialGapHeight; 
+
+    int score = 0;
+    int passedPipe = 0;
+    int gameOver = 0;
+
+    printf("\n====================================\n");
+    printf("   NIE FLAPPY BIRD: ULTRA SMOOTH    \n");
+    printf("====================================\n");
+    printf("SCORE: %d\n", score);
+
+    int running = 1;
+    SDL_Event event;
+
+    while (running) {
+        while (SDL_PollEvent(&event)) {
+            if (event.type == SDL_QUIT) {
+                running = 0;
+            }
+            else if (event.type == SDL_KEYDOWN) {
+                if (event.key.keysym.sym == SDLK_SPACE && !gameOver) {
+                    velocity = jumpStrength; 
+                    playPreloadedSound(jumpSoundBuffer, jumpSampleCount); // Instant trigger
+                }
+                if (event.key.keysym.sym == SDLK_r && gameOver) {
+                    gameOver = 0;
+                    score = 0;
+                    currentPipeSpeed = initialPipeSpeed;
+                    currentGapHeight = initialGapHeight;
+                    birdY = 240.0;
+                    velocity = 0;
+                    pipeX = 640;
+                    bgX = 0;
+                    printf("SYSTEM: Game Restarted!\n");
+                    printf("SCORE: %d\n", score);
+                }
+            }
+        }
+
+        if (!gameOver) {
+            velocity += gravity;
+            birdY += velocity;
+            pipeX -= currentPipeSpeed;
+            
+            // Loop background seamlessly without index shift anomalies
+            bgX -= bgSpeed;
+            if (bgX <= -120) {
+                bgX = 0; 
+            }
+
+            for (int i = MAX_TRAIL - 1; i > 0; i--) {
+                trailX[i] = trailX[i - 1];
+                trailY[i] = trailY[i - 1];
+            }
+            trailX[0] = (int)birdX;
+            trailY[0] = (int)birdY;
+
+            if (pipeX + pipeWidth < birdX && !passedPipe) {
+                score++;
+                passedPipe = 1; 
+                printf("SCORE: %d 	🌟\n", score);
+
+                if (score > 0 && score % 2 == 0) {
+                    currentPipeSpeed += 0.4;
+                    if (currentGapHeight > 95) {
+                        currentGapHeight -= 8; 
+                    }
+                    printf("SYSTEM: Difficulty Up! Speed: %.1f | Gap Clearance: %dpx\n", currentPipeSpeed, currentGapHeight);
+                }
+            }
+
+            if (pipeX < -pipeWidth) {
+                pipeX = 640;
+                gapY = (rand() % 200) + 60; 
+                passedPipe = 0; 
+            }
+
+            if (birdY > 450) { birdY = 450; velocity = 0; }
+            if (birdY < 15) { birdY = 15; velocity = 0; }
+
+            SDL_Rect birdRect = { (int)birdX - birdRadius, (int)birdY - birdRadius, birdRadius * 2, birdRadius * 2 };
+            SDL_Rect topPipeRect = { (int)pipeX, 0, pipeWidth, gapY };
+            SDL_Rect bottomPipeRect = { (int)pipeX, gapY + currentGapHeight, pipeWidth, 480 - (gapY + currentGapHeight) };
+
+            if (SDL_HasIntersection(&birdRect, &topPipeRect) || 
+                SDL_HasIntersection(&birdRect, &bottomPipeRect) || 
+                birdY >= 450) { 
+                
+                gameOver = 1;
+                playPreloadedSound(crashSoundBuffer, crashSampleCount); 
+                printf("\n====================================\n");
+                printf("   GAME OVER: Final Score %d \n", score);
+                printf("   Press [R] to reload execution loop.\n");
+                printf("====================================\n");
+            }
+        } 
+
+        // RENDER PIPELINE
+        SDL_SetRenderDrawColor(renderer, bgColor.r, bgColor.g, bgColor.b, 255); 
+        SDL_RenderClear(renderer);
+
+        // Fixed cityscape alignment to prevent shifting glitch
+        SDL_SetRenderDrawColor(renderer, cityColor.r, cityColor.g, cityColor.b, 255);
+        for (int i = 0; i < 7; i++) {
+            int currentBuildingHeight = buildingHeights[i];
+            SDL_Rect building = { (int)bgX + (i * 120), 480 - currentBuildingHeight, 115, currentBuildingHeight };
+            SDL_RenderFillRect(renderer, &building);
+        }
+
+        // Draw Particle Trail
+        for (int i = 0; i < MAX_TRAIL; i++) {
+            if (trailX[i] != -100) {
+                int currentRadius = birdRadius - (i * 2);
+                if (currentRadius < 4) currentRadius = 4;
+                SDL_SetRenderDrawColor(renderer, birdColor.r, birdColor.g, birdColor.b, 255 - (i * 50));
+                drawCircle(renderer, trailX[i], trailY[i], currentRadius);
+            }
+        }
+
+        // Draw Advanced Geometry Bird
+        if (!gameOver) {
+            SDL_SetRenderDrawColor(renderer, birdColor.r, birdColor.g, birdColor.b, 255);
+            drawCircle(renderer, (int)birdX, (int)birdY, birdRadius); 
+            SDL_SetRenderDrawColor(renderer, eyeColor.r, eyeColor.g, eyeColor.b, 255);
+            drawCircle(renderer, (int)birdX + 6, (int)birdY - 4, 4);  
+        } else {
+            SDL_SetRenderDrawColor(renderer, 220, 50, 50, 255);
+            drawCircle(renderer, (int)birdX, (int)birdY, birdRadius);
+        }
+
+        // Draw Pipes
+        SDL_SetRenderDrawColor(renderer, pipeColor.r, pipeColor.g, pipeColor.b, 255); 
+        SDL_Rect topPipeRect = { (int)pipeX, 0, pipeWidth, gapY };
+        SDL_Rect bottomPipeRect = { (int)pipeX, gapY + currentGapHeight, pipeWidth, 480 - (gapY + currentGapHeight) };
+        SDL_RenderFillRect(renderer, &topPipeRect);
+        SDL_RenderFillRect(renderer, &bottomPipeRect);
+
+        SDL_RenderPresent(renderer);
+    } // This explicitly closes the while loop
+
+    // Clean up memory before program exit
+    if(audioDevice) SDL_CloseAudioDevice(audioDevice);
+    free(jumpSoundBuffer);
+    free(crashSoundBuffer);
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
+    SDL_Quit();
+    return 0;
+} // This explicitly closes the main function
